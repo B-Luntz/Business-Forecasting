@@ -1,0 +1,222 @@
+---
+title: "Business Forecasting Homework: Dublin Monthly Rainfall (1976-1999)"
+author: "Brian Luntz"
+date: "10-3-2026"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 10, fig.height = 5)
+library(forecast)
+library(ggplot2)
+library(knitr)
+```
+
+# 1. Data
+
+The data are monthly rainfall (mm) at the Dublin (Ringsend) weather station, January 1976 to December 1999 (288 months). The file has a 13-line text header, then columns `year, month, ind, rain, gdf, rd, wd`. We only need `rain`.
+
+Some months are missing. Either the row is absent (e.g., parts of 1993, 1994, 1995 and 1998) or the row exists with a blank `rain` value (indicator `ind = 8`). To get a regular monthly time series, I first build the full 288-month calendar and then fill the gaps.
+
+```{r load}
+raw <- read.csv("Dublin_Rainfall_1976-1999.csv", skip = 13,
+                stringsAsFactors = FALSE, strip.white = TRUE)
+raw$rain <- suppressWarnings(as.numeric(raw$rain))   # blanks become NA
+
+# full calendar so absent months show up as NA
+cal <- expand.grid(month = 1:12, year = 1976:1999)
+dat <- merge(cal, raw[, c("year", "month", "rain")], by = c("year", "month"), all.x = TRUE)
+dat <- dat[order(dat$year, dat$month), ]
+
+n_missing <- sum(is.na(dat$rain))
+n_missing
+```
+
+There are **`r n_missing`** missing months out of `r nrow(dat)`. I fill them with `na.interp()`, which uses seasonal interpolation (it respects the monthly pattern rather than drawing a straight line). With only about `r round(100*n_missing/nrow(dat),1)`% of months affected, this should not change the conclusions.
+
+```{r ts}
+rain_raw <- ts(dat$rain, start = c(1976, 1), frequency = 12)
+rain     <- na.interp(rain_raw)
+
+summary(as.numeric(rain))
+imp <- data.frame(time = as.numeric(time(rain))[is.na(rain_raw)],
+                  rain = as.numeric(rain)[is.na(rain_raw)])
+autoplot(rain) +
+  geom_point(data = imp, aes(x = time, y = rain), colour = "red", size = 1.5) +
+  labs(title = "Dublin monthly rainfall (red points = interpolated months)",
+       x = "Year", y = "Rainfall (mm)")
+```
+
+```{r explore}
+ggseasonplot(rain, year.labels = FALSE) + labs(title = "Seasonal plot")
+ggAcf(rain, lag.max = 36) + labs(title = "ACF of monthly rainfall")
+```
+
+**What we see:** Rainfall bounces around a stable level with no clear upward or downward trend. There is a mild seasonal pattern (autumn/winter tend to be wetter than spring/early summer), but it is weak compared with the month-to-month noise. The ACF has small spikes, so past values contain little information about the next month. This tells us that fancy models will probably not beat simple ones by much.
+
+# 2. Train / test split
+
+To compare forecasts fairly, I fit every model on the **training set (1976-1997)** and test it on the **last 24 months (1998-1999)**, which the models do not see.
+
+```{r split}
+h     <- 24
+train <- window(rain, end = c(1997, 12))
+test  <- window(rain, start = c(1998, 1))
+length(train); length(test)
+```
+
+# 3. Forecast models
+
+I fit eight models.
+
+| Model | Idea |
+|---|---|
+| Mean | Forecast = average of all training data |
+| Naive | Forecast = last observed value |
+| Seasonal naive | Forecast = value from the same month last year |
+| Drift | Naive plus the average change over time (a straight line between first and last points) |
+| MA(5) | Forecast = average of the last 5 months (flat) |
+| MA(9) | Forecast = average of the last 9 months (flat) |
+| ETS | Exponential smoothing; the best error/trend/seasonal form is picked automatically by AICc |
+| ARIMA | Auto-selected seasonal ARIMA (included as an extra) |
+
+```{r models}
+# helper: flat forecast from a trailing moving average of the last k observations
+ma_fc <- function(y, k, h) {
+  f <- mean(tail(y, k))
+  ts(rep(f, h), start = tsp(y)[2] + 1/12, frequency = 12)
+}
+
+fc_mean  <- meanf(train, h = h)
+fc_naive <- naive(train, h = h)
+fc_snaive<- snaive(train, h = h)
+fc_drift <- rwf(train, drift = TRUE, h = h)
+fc_ma5   <- ma_fc(train, 5, h)
+fc_ma9   <- ma_fc(train, 9, h)
+fit_ets  <- ets(train)
+fc_ets   <- forecast(fit_ets, h = h)
+fit_arima<- auto.arima(train)
+fc_arima <- forecast(fit_arima, h = h)
+```
+
+## 3.1 Understanding the output
+
+### Moving averages
+MA(k) averages the last k months, and that single number becomes the forecast for every future month. A larger k smooths more (less noise, slower to react). Here are the two flat forecasts:
+
+```{r ma-out}
+data.frame(Model = c("MA(5)", "MA(9)"),
+           Forecast_mm = c(fc_ma5[1], fc_ma9[1])) |> kable(digits = 1)
+```
+
+### ETS
+```{r ets-out}
+fit_ets
+```
+
+The label `ETS(Error, Trend, Seasonal)` tells you the chosen form (A = additive, M = multiplicative, N = none). **alpha** is the smoothing weight on the level: values near 0 mean the level changes slowly and the forecast leans on the long-run average, values near 1 mean the forecast chases the latest observation. **gamma** (if present) does the same for the seasonal pattern.
+
+*In my run:* ETS chose **(M,N,A)**: multiplicative errors, no trend, additive seasonality. Both alpha and gamma are essentially 0, so the level and the seasonal pattern are treated as almost fixed over time. In plain terms, the model forecasts "the long-run average (about 57 mm) plus a fixed seasonal adjustment for each month," and does not chase recent observations. This matches the exploration: no trend, a stable level, and a mild seasonal pattern. AIC/AICc/BIC are fit-versus-complexity scores (lower is better); `sigma^2` is the residual variance.
+
+### ARIMA
+```{r arima-out}
+fit_arima
+```
+
+The `ARIMA(p,d,q)(P,D,Q)[12]` label gives the non-seasonal and seasonal autoregressive, differencing and moving-average orders. A model with no or few terms means the series is close to random noise around a mean (plus any seasonal term).
+
+*In my run:* auto.arima picked **ARIMA(1,0,0)(1,0,0)[12] with non-zero mean**. No differencing (d = 0) confirms the series is stationary (no trend). The AR(1) coefficient (about 0.18) and seasonal AR coefficient (about 0.08) are small: this month's rain explains only a little of next month's, and last year's same month explains even less. The mean is about 58 mm, so the forecasts quickly settle near that level.
+
+### Residual check (ETS)
+```{r resid}
+checkresiduals(fit_ets)
+```
+
+If the residuals look like white noise (no significant ACF spikes, Ljung-Box p-value above 0.05), the model has captured the available pattern.
+
+*In my run:* the Ljung-Box p-value is about 0.79, well above 0.05, so there is no evidence of leftover autocorrelation. The ETS residuals behave like white noise and the model is adequate.
+
+# 4. All forecasts on one chart
+
+```{r plot-all}
+fc_df <- data.frame(
+  time  = as.numeric(time(test)),
+  Mean  = as.numeric(fc_mean$mean),
+  Naive = as.numeric(fc_naive$mean),
+  SNaive= as.numeric(fc_snaive$mean),
+  Drift = as.numeric(fc_drift$mean),
+  `MA(5)` = as.numeric(fc_ma5),
+  `MA(9)` = as.numeric(fc_ma9),
+  ETS   = as.numeric(fc_ets$mean),
+  ARIMA = as.numeric(fc_arima$mean),
+  check.names = FALSE
+)
+fc_long <- reshape(fc_df, direction = "long",
+                   varying = names(fc_df)[-1], v.names = "rain",
+                   timevar = "Model", times = names(fc_df)[-1])
+
+hist_df <- data.frame(time = as.numeric(time(window(rain, start = c(1993, 1)))),
+                      rain = as.numeric(window(rain, start = c(1993, 1))))
+
+ggplot() +
+  geom_line(data = hist_df, aes(time, rain), colour = "black", linewidth = 0.7) +
+  geom_line(data = fc_long, aes(time, rain, colour = Model), linewidth = 0.9) +
+  geom_vline(xintercept = 1998, linetype = "dashed") +
+  labs(title = "Actual rainfall (black) and 24-month forecasts from each model",
+       subtitle = "Showing 1993-1999; dashed line = start of the test period",
+       x = "Year", y = "Rainfall (mm)")
+```
+
+The flat lines (Mean, Naive, Drift, MA) cannot follow the seasonal ups and downs, while Seasonal naive, ETS and ARIMA (if they include seasonality) wiggle. The plot shows how all the forecasts sit relative to the actual 1998-1999 values.
+
+# 5. Accuracy comparison
+
+I use **RMSE** (root mean squared error) as the main measure. It is in the same units as the data (mm) and penalises large misses, which matter for rainfall. I also report MAE and MAPE for reference.
+
+```{r accuracy}
+act <- as.numeric(test)
+acc <- function(pred) {
+  e <- act - as.numeric(pred)
+  c(RMSE = sqrt(mean(e^2)), MAE = mean(abs(e)), MAPE = mean(abs(e / act)) * 100)
+}
+acc_tab <- rbind(
+  Mean = acc(fc_mean$mean),   Naive = acc(fc_naive$mean),
+  `Seasonal naive` = acc(fc_snaive$mean), Drift = acc(fc_drift$mean),
+  `MA(5)` = acc(fc_ma5), `MA(9)` = acc(fc_ma9),
+  ETS = acc(fc_ets$mean), ARIMA = acc(fc_arima$mean)
+)
+acc_tab <- as.data.frame(acc_tab)
+acc_tab <- acc_tab[order(acc_tab$RMSE), ]
+kable(acc_tab, digits = 2, caption = "Test-set accuracy (1998-1999), sorted by RMSE")
+
+best <- rownames(acc_tab)[1]
+```
+
+```{r acc-plot}
+ggplot(data.frame(Model = factor(rownames(acc_tab), levels = rev(rownames(acc_tab))),
+                  RMSE = acc_tab$RMSE), aes(Model, RMSE)) +
+  geom_col(fill = "steelblue") + coord_flip() +
+  labs(title = "Test-set RMSE by model (lower is better)", y = "RMSE (mm)")
+```
+
+# 6. Conclusion
+
+Based on RMSE on the 24-month hold-out set, the best model is **`r best`** (RMSE = `r round(acc_tab$RMSE[1], 2)` mm).
+
+```{r interp, echo=FALSE, results='asis'}
+cat("Ranking by RMSE: ", paste(rownames(acc_tab), collapse = " < "), ".\n", sep = "")
+```
+
+**Interpretation** (based on the numbers above; re-check if you change the data or split):
+
+* **ETS, ARIMA and the plain Mean are close.** Their RMSEs differ by under 1 mm, which is small relative to the typical monthly swing. Rainfall here is mostly noise around a stable average, so the best models are the ones that predict "about average, adjusted slightly for the season."
+* **Naive and Drift do worse.** They copy the last observation (a single noisy month), so one unusually wet or dry month at the end of 1997 gets carried through the whole forecast.
+* **Seasonal naive has the highest RMSE.** It repeats one specific month from last year, including that month's random noise. The seasonal pattern is real but weak, so copying it exactly adds more error than it removes.
+* **MA(9) beats MA(5).** Averaging more months smooths out more noise and moves closer to the long-run mean. This is the same reason the full-sample Mean does well.
+* **Best model: ETS(M,N,A).** It wins on RMSE, MAE and MAPE together. The caveat is that the test set is only 24 months, so its small edge over ARIMA and the Mean is not conclusive. For practical purposes, any of these three is a reasonable forecaster of Dublin rainfall.
+
